@@ -18,6 +18,12 @@ class DatabaseToolkit:
     def get_keys(self, table_name):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
+    def get_row_count(self, table_name):
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
+    def get_sample(self, table_name, limit=5):
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
     def get_full_schema(self):
         tables = self.get_tables()
         schema = {
@@ -28,7 +34,8 @@ class DatabaseToolkit:
             table_info = {
                 "name": table_name,
                 "columns": self.get_columns(table_name),
-                "keys": self.get_keys(table_name)
+                "keys": self.get_keys(table_name),
+                "row_count": self.get_row_count(table_name)
             }
             schema["tables"].append(table_info)
         schema["views"] = self.get_views()
@@ -118,6 +125,28 @@ class PostgresToolkit(DatabaseToolkit):
                 for row in cursor.fetchall()
             ]
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_row_count(self, table_name):
+        conn = psycopg2.connect(**self.connection_info)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f'SELECT COUNT(*) FROM "{table_name}";')
+            return cursor.fetchone()[0]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_sample(self, table_name, limit=5):
+        conn = psycopg2.connect(**self.connection_info)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT {limit};')
+            column_names = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            return [dict(zip(column_names, row)) for row in rows]
         finally:
             cursor.close()
             conn.close()
@@ -212,6 +241,28 @@ class SqlServerToolkit(DatabaseToolkit):
                 for row in cursor.fetchall()
             ]
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_row_count(self, table_name):
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f'SELECT COUNT(*) FROM [{table_name}];')
+            return cursor.fetchone()[0]
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_sample(self, table_name, limit=5):
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f'SELECT TOP {limit} * FROM [{table_name}];')
+            column_names = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            return [dict(zip(column_names, row)) for row in rows]
         finally:
             cursor.close()
             conn.close()
