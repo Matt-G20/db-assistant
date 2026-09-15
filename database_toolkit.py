@@ -190,11 +190,26 @@ class PostgresToolkit(DatabaseToolkit):
 
 
 class SqlServerToolkit(DatabaseToolkit):
+    # Fallback schema used only when a caller passes a bare (unqualified)
+    # table name directly to get_columns/get_keys/get_row_count/get_sample
+    # instead of the "schema.table" form get_tables() returns. SQL Server
+    # databases routinely spread tables across multiple schemas (e.g. the
+    # AdventureWorks sample uses Sales, Person, Production, ...), so -
+    # unlike PostgresToolkit, which only ever deals with 'public' -
+    # get_tables() here returns every schema, qualified, rather than
+    # silently hiding everything outside one hardcoded schema.
     SCHEMA = "dbo"
 
     @staticmethod
     def _quote_identifier(name):
         return "[" + name.replace("]", "]]") + "]"
+
+    @classmethod
+    def _split_schema_table(cls, table_name):
+        if "." in table_name:
+            schema, _, name = table_name.partition(".")
+            return schema, name
+        return cls.SCHEMA, table_name
 
     @staticmethod
     def _escape_conn_value(value):
@@ -224,22 +239,22 @@ class SqlServerToolkit(DatabaseToolkit):
     def get_tables(self, conn=None):
         with self._cursor(conn) as cursor:
             cursor.execute("""
-                SELECT TABLE_NAME
+                SELECT TABLE_SCHEMA, TABLE_NAME
                 FROM INFORMATION_SCHEMA.TABLES
                 WHERE TABLE_TYPE = 'BASE TABLE'
-                  AND TABLE_SCHEMA = 'dbo'
-                ORDER BY TABLE_NAME
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
             """)
-            return [row[0] for row in cursor.fetchall()]
+            return [f"{row[0]}.{row[1]}" for row in cursor.fetchall()]
 
     def get_columns(self, table_name, conn=None):
+        schema, name = self._split_schema_table(table_name)
         with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
                 FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                 ORDER BY ORDINAL_POSITION
-            """, (table_name,))
+            """, (schema, name))
             return [
                 {"name": row[0], "type": row[1], "nullable": row[2]}
                 for row in cursor.fetchall()
@@ -248,17 +263,17 @@ class SqlServerToolkit(DatabaseToolkit):
     def get_views(self, conn=None):
         with self._cursor(conn) as cursor:
             cursor.execute("""
-                SELECT TABLE_NAME, VIEW_DEFINITION
+                SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION
                 FROM INFORMATION_SCHEMA.VIEWS
-                WHERE TABLE_SCHEMA = 'dbo'
-                ORDER BY TABLE_NAME
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
             """)
             return [
-                {"name": row[0], "definition": row[1]}
+                {"name": f"{row[0]}.{row[1]}", "definition": row[2]}
                 for row in cursor.fetchall()
             ]
 
     def get_keys(self, table_name, conn=None):
+        schema, name = self._split_schema_table(table_name)
         with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT c.name AS column_name
@@ -270,10 +285,10 @@ class SqlServerToolkit(DatabaseToolkit):
                 JOIN sys.tables t ON t.object_id = i.object_id
                 JOIN sys.schemas s ON s.schema_id = t.schema_id
                 WHERE i.is_primary_key = 1
-                  AND s.name = 'dbo'
+                  AND s.name = ?
                   AND t.name = ?
                 ORDER BY ic.key_ordinal
-            """, (table_name,))
+            """, (schema, name))
             primary_keys = [row[0] for row in cursor.fetchall()]
 
             # sys.foreign_key_columns already stores one row per column
@@ -283,6 +298,7 @@ class SqlServerToolkit(DatabaseToolkit):
             cursor.execute("""
                 SELECT
                     pc.name AS column_name,
+                    rs.name AS references_schema,
                     rt.name AS references_table,
                     rc.name AS references_column
                 FROM sys.foreign_key_columns fkc
@@ -292,33 +308,37 @@ class SqlServerToolkit(DatabaseToolkit):
                   ON fkc.parent_object_id = pc.object_id
                  AND fkc.parent_column_id = pc.column_id
                 JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id
+                JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
                 JOIN sys.columns rc
                   ON fkc.referenced_object_id = rc.object_id
                  AND fkc.referenced_column_id = rc.column_id
-                WHERE s.name = 'dbo'
+                WHERE s.name = ?
                   AND t.name = ?
                 ORDER BY fkc.constraint_column_id
-            """, (table_name,))
+            """, (schema, name))
             foreign_keys = [
-                {"column": row[0], "references_table": row[1], "references_column": row[2]}
+                {
+                    "column": row[0],
+                    "references_table": f"{row[1]}.{row[2]}",
+                    "references_column": row[3],
+                }
                 for row in cursor.fetchall()
             ]
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
 
     def get_row_count(self, table_name, conn=None):
+        schema, name = self._split_schema_table(table_name)
         with self._cursor(conn) as cursor:
-            quoted_table = self._quote_identifier(table_name)
-            cursor.execute(f"SELECT COUNT(*) FROM [{self.SCHEMA}].{quoted_table};")
+            quoted = f"{self._quote_identifier(schema)}.{self._quote_identifier(name)}"
+            cursor.execute(f"SELECT COUNT(*) FROM {quoted};")
             return cursor.fetchone()[0]
 
     def get_sample(self, table_name, limit=5, conn=None):
         limit = int(limit)
+        schema, name = self._split_schema_table(table_name)
         with self._cursor(conn) as cursor:
-            quoted_table = self._quote_identifier(table_name)
-            cursor.execute(
-                f"SELECT TOP (?) * FROM [{self.SCHEMA}].{quoted_table};",
-                (limit,),
-            )
+            quoted = f"{self._quote_identifier(schema)}.{self._quote_identifier(name)}"
+            cursor.execute(f"SELECT TOP (?) * FROM {quoted};", (limit,))
             column_names = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
             return [dict(zip(column_names, row)) for row in rows]
