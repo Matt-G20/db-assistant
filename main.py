@@ -32,6 +32,8 @@ def build_toolkit(req: ConnectionRequest):
             "driver": req.driver,
             "server": req.server,
             "database": req.database,
+            "user": req.user,
+            "password": req.password,
         }
         return SqlServerToolkit(connection_info)
     else:

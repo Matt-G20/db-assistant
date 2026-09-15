@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2 import sql
 import pyodbc
 
 
@@ -6,45 +7,62 @@ class DatabaseToolkit:
     def __init__(self, connection_info):
         self.connection_info = connection_info
 
-    def get_tables(self):
+    def _connect(self):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
-    def get_columns(self, table_name):
+    def get_tables(self, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
-    def get_views(self):
+    def get_columns(self, table_name, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
-    def get_keys(self, table_name):
+    def get_views(self, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
-    def get_row_count(self, table_name):
+    def get_keys(self, table_name, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
-    def get_sample(self, table_name, limit=5):
+    def get_row_count(self, table_name, conn=None):
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
+    def get_sample(self, table_name, limit=5, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
     def get_full_schema(self):
-        tables = self.get_tables()
-        schema = {
-            "database_type": self.__class__.__name__,
-            "tables": []
-        }
-        for table_name in tables:
-            table_info = {
-                "name": table_name,
-                "columns": self.get_columns(table_name),
-                "keys": self.get_keys(table_name),
-                "row_count": self.get_row_count(table_name)
+        # Open a single connection and thread it through every call below
+        # instead of letting each get_* method open its own. Without this,
+        # a database with N tables opened 3N+1 separate connections just to
+        # build one schema snapshot.
+        conn = self._connect()
+        try:
+            tables = self.get_tables(conn=conn)
+            schema = {
+                "database_type": self.__class__.__name__,
+                "tables": []
             }
-            schema["tables"].append(table_info)
-        schema["views"] = self.get_views()
-        return schema
+            for table_name in tables:
+                table_info = {
+                    "name": table_name,
+                    "columns": self.get_columns(table_name, conn=conn),
+                    "keys": self.get_keys(table_name, conn=conn),
+                    "row_count": self.get_row_count(table_name, conn=conn)
+                }
+                schema["tables"].append(table_info)
+            schema["views"] = self.get_views(conn=conn)
+            return schema
+        finally:
+            conn.close()
 
 
 class PostgresToolkit(DatabaseToolkit):
-    def get_tables(self):
-        conn = psycopg2.connect(**self.connection_info)
+    SCHEMA = "public"
+
+    def _connect(self):
+        return psycopg2.connect(**self.connection_info)
+
+    def get_tables(self, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -56,10 +74,12 @@ class PostgresToolkit(DatabaseToolkit):
             return [row[0] for row in cursor.fetchall()]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_columns(self, table_name):
-        conn = psycopg2.connect(**self.connection_info)
+    def get_columns(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -74,10 +94,12 @@ class PostgresToolkit(DatabaseToolkit):
             ]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_views(self):
-        conn = psycopg2.connect(**self.connection_info)
+    def get_views(self, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -92,10 +114,12 @@ class PostgresToolkit(DatabaseToolkit):
             ]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_keys(self, table_name):
-        conn = psycopg2.connect(**self.connection_info)
+    def get_keys(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
@@ -103,22 +127,41 @@ class PostgresToolkit(DatabaseToolkit):
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage kcu
                   ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
                 WHERE tc.table_schema = 'public'
                   AND tc.table_name = %s
                   AND tc.constraint_type = 'PRIMARY KEY'
+                ORDER BY kcu.ordinal_position
             """, (table_name,))
             primary_keys = [row[0] for row in cursor.fetchall()]
 
+            # Note: joining key_column_usage/constraint_column_usage on
+            # constraint_name alone produces a cartesian product for
+            # composite (multi-column) foreign keys, silently pairing up
+            # unrelated columns. Using pg_constraint's conkey/confkey
+            # arrays (zipped positionally via unnest) pairs each local
+            # column with its correct referenced column instead.
             cursor.execute("""
-                SELECT kcu.column_name, ccu.table_name, ccu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                JOIN information_schema.constraint_column_usage ccu
-                  ON tc.constraint_name = ccu.constraint_name
-                WHERE tc.table_schema = 'public'
-                  AND tc.table_name = %s
-                  AND tc.constraint_type = 'FOREIGN KEY'
+                SELECT
+                    parent_att.attname AS column_name,
+                    referenced_cl.relname AS references_table,
+                    referenced_att.attname AS references_column
+                FROM pg_constraint con
+                JOIN pg_class cl ON cl.oid = con.conrelid
+                JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                JOIN pg_class referenced_cl ON referenced_cl.oid = con.confrelid
+                CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
+                    WITH ORDINALITY AS cols(parent_attnum, referenced_attnum, ord)
+                JOIN pg_attribute parent_att
+                    ON parent_att.attrelid = con.conrelid
+                   AND parent_att.attnum = cols.parent_attnum
+                JOIN pg_attribute referenced_att
+                    ON referenced_att.attrelid = con.confrelid
+                   AND referenced_att.attnum = cols.referenced_attnum
+                WHERE con.contype = 'f'
+                  AND ns.nspname = 'public'
+                  AND cl.relname = %s
+                ORDER BY cols.ord
             """, (table_name,))
             foreign_keys = [
                 {"column": row[0], "references_table": row[1], "references_column": row[2]}
@@ -127,65 +170,92 @@ class PostgresToolkit(DatabaseToolkit):
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_row_count(self, table_name):
-        conn = psycopg2.connect(**self.connection_info)
+    def get_row_count(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
-            cursor.execute(f'SELECT COUNT(*) FROM "{table_name}";')
+            query = sql.SQL("SELECT COUNT(*) FROM {}").format(
+                sql.Identifier(self.SCHEMA, table_name)
+            )
+            cursor.execute(query)
             return cursor.fetchone()[0]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_sample(self, table_name, limit=5):
-        conn = psycopg2.connect(**self.connection_info)
+    def get_sample(self, table_name, limit=5, conn=None):
+        limit = int(limit)
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
-            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT {limit};')
+            query = sql.SQL("SELECT * FROM {} LIMIT %s").format(
+                sql.Identifier(self.SCHEMA, table_name)
+            )
+            cursor.execute(query, (limit,))
             column_names = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
             return [dict(zip(column_names, row)) for row in rows]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
 
 class SqlServerToolkit(DatabaseToolkit):
+    SCHEMA = "dbo"
+
+    @staticmethod
+    def _quote_identifier(name):
+        return "[" + name.replace("]", "]]") + "]"
+
     def _connect(self):
         conn_str = (
             f"DRIVER={{{self.connection_info['driver']}}};"
             f"SERVER={self.connection_info['server']};"
             f"DATABASE={self.connection_info['database']};"
-            f"Trusted_Connection=yes;"
         )
+        user = self.connection_info.get("user")
+        password = self.connection_info.get("password")
+        if user:
+            conn_str += f"UID={user};PWD={password};"
+        else:
+            conn_str += "Trusted_Connection=yes;"
         return pyodbc.connect(conn_str)
 
-    def get_tables(self):
-        conn = self._connect()
+    def get_tables(self, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_type = 'BASE TABLE'
-                ORDER BY table_name
+                SELECT TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE = 'BASE TABLE'
+                  AND TABLE_SCHEMA = 'dbo'
+                ORDER BY TABLE_NAME
             """)
             return [row[0] for row in cursor.fetchall()]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_columns(self, table_name):
-        conn = self._connect()
+    def get_columns(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_name = ?
-                ORDER BY ordinal_position
+                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION
             """, (table_name,))
             return [
                 {"name": row[0], "type": row[1], "nullable": row[2]}
@@ -193,16 +263,19 @@ class SqlServerToolkit(DatabaseToolkit):
             ]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_views(self):
-        conn = self._connect()
+    def get_views(self, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT table_name, view_definition
-                FROM information_schema.views
-                ORDER BY table_name
+                SELECT TABLE_NAME, VIEW_DEFINITION
+                FROM INFORMATION_SCHEMA.VIEWS
+                WHERE TABLE_SCHEMA = 'dbo'
+                ORDER BY TABLE_NAME
             """)
             return [
                 {"name": row[0], "definition": row[1]}
@@ -210,31 +283,52 @@ class SqlServerToolkit(DatabaseToolkit):
             ]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_keys(self, table_name):
-        conn = self._connect()
+    def get_keys(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT kcu.COLUMN_NAME
-                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-                  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-                WHERE tc.TABLE_NAME = ?
-                  AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                SELECT c.name AS column_name
+                FROM sys.indexes i
+                JOIN sys.index_columns ic
+                  ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                JOIN sys.columns c
+                  ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                JOIN sys.tables t ON t.object_id = i.object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                WHERE i.is_primary_key = 1
+                  AND s.name = 'dbo'
+                  AND t.name = ?
+                ORDER BY ic.key_ordinal
             """, (table_name,))
             primary_keys = [row[0] for row in cursor.fetchall()]
 
+            # sys.foreign_key_columns already stores one row per column
+            # pair (correctly matched via constraint_column_id), unlike
+            # the INFORMATION_SCHEMA key_column_usage/constraint_column_usage
+            # join which cartesian-products composite foreign keys.
             cursor.execute("""
-                SELECT kcu.COLUMN_NAME, ccu.TABLE_NAME, ccu.COLUMN_NAME
-                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-                  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-                JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
-                  ON tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
-                WHERE tc.TABLE_NAME = ?
-                  AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+                SELECT
+                    pc.name AS column_name,
+                    rt.name AS references_table,
+                    rc.name AS references_column
+                FROM sys.foreign_key_columns fkc
+                JOIN sys.tables t ON fkc.parent_object_id = t.object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                JOIN sys.columns pc
+                  ON fkc.parent_object_id = pc.object_id
+                 AND fkc.parent_column_id = pc.column_id
+                JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id
+                JOIN sys.columns rc
+                  ON fkc.referenced_object_id = rc.object_id
+                 AND fkc.referenced_column_id = rc.column_id
+                WHERE s.name = 'dbo'
+                  AND t.name = ?
+                ORDER BY fkc.constraint_column_id
             """, (table_name,))
             foreign_keys = [
                 {"column": row[0], "references_table": row[1], "references_column": row[2]}
@@ -243,26 +337,37 @@ class SqlServerToolkit(DatabaseToolkit):
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_row_count(self, table_name):
-        conn = self._connect()
+    def get_row_count(self, table_name, conn=None):
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
-            cursor.execute(f'SELECT COUNT(*) FROM [{table_name}];')
+            quoted_table = self._quote_identifier(table_name)
+            cursor.execute(f"SELECT COUNT(*) FROM [{self.SCHEMA}].{quoted_table};")
             return cursor.fetchone()[0]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
 
-    def get_sample(self, table_name, limit=5):
-        conn = self._connect()
+    def get_sample(self, table_name, limit=5, conn=None):
+        limit = int(limit)
+        owns_conn = conn is None
+        conn = conn or self._connect()
         cursor = conn.cursor()
         try:
-            cursor.execute(f'SELECT TOP {limit} * FROM [{table_name}];')
+            quoted_table = self._quote_identifier(table_name)
+            cursor.execute(
+                f"SELECT TOP (?) * FROM [{self.SCHEMA}].{quoted_table};",
+                (limit,),
+            )
             column_names = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
             return [dict(zip(column_names, row)) for row in rows]
         finally:
             cursor.close()
-            conn.close()
+            if owns_conn:
+                conn.close()
