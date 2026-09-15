@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import psycopg2
 from psycopg2 import sql
 import pyodbc
@@ -9,6 +11,28 @@ class DatabaseToolkit:
 
     def _connect(self):
         raise NotImplementedError("This method should be implemented by subclasses.")
+
+    @contextmanager
+    def _cursor(self, conn=None):
+        """Yield a cursor for a query.
+
+        If the caller didn't pass a connection, one is opened here and
+        closed here when the block exits (even if cursor creation or the
+        query itself raises). If the caller passed a connection (as
+        get_full_schema does, to reuse one connection across many calls),
+        it is left open for the caller to close.
+        """
+        owns_conn = conn is None
+        conn = conn or self._connect()
+        try:
+            cursor = conn.cursor()
+            try:
+                yield cursor
+            finally:
+                cursor.close()
+        finally:
+            if owns_conn:
+                conn.close()
 
     def get_tables(self, conn=None):
         raise NotImplementedError("This method should be implemented by subclasses.")
@@ -61,10 +85,7 @@ class PostgresToolkit(DatabaseToolkit):
         return psycopg2.connect(**self.connection_info)
 
     def get_tables(self, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT table_name
                 FROM information_schema.tables
@@ -72,16 +93,9 @@ class PostgresToolkit(DatabaseToolkit):
                 ORDER BY table_name
             """)
             return [row[0] for row in cursor.fetchall()]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_columns(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT column_name, data_type, is_nullable
                 FROM information_schema.columns
@@ -92,16 +106,9 @@ class PostgresToolkit(DatabaseToolkit):
                 {"name": row[0], "type": row[1], "nullable": row[2]}
                 for row in cursor.fetchall()
             ]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_views(self, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT table_name, view_definition
                 FROM information_schema.views
@@ -112,16 +119,9 @@ class PostgresToolkit(DatabaseToolkit):
                 {"name": row[0], "definition": row[1]}
                 for row in cursor.fetchall()
             ]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_keys(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT kcu.column_name
                 FROM information_schema.table_constraints tc
@@ -168,32 +168,18 @@ class PostgresToolkit(DatabaseToolkit):
                 for row in cursor.fetchall()
             ]
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_row_count(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             query = sql.SQL("SELECT COUNT(*) FROM {}").format(
                 sql.Identifier(self.SCHEMA, table_name)
             )
             cursor.execute(query)
             return cursor.fetchone()[0]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_sample(self, table_name, limit=5, conn=None):
         limit = int(limit)
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             query = sql.SQL("SELECT * FROM {} LIMIT %s").format(
                 sql.Identifier(self.SCHEMA, table_name)
             )
@@ -201,10 +187,6 @@ class PostgresToolkit(DatabaseToolkit):
             column_names = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
             return [dict(zip(column_names, row)) for row in rows]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
 
 class SqlServerToolkit(DatabaseToolkit):
@@ -214,25 +196,33 @@ class SqlServerToolkit(DatabaseToolkit):
     def _quote_identifier(name):
         return "[" + name.replace("]", "]]") + "]"
 
+    @staticmethod
+    def _escape_conn_value(value):
+        # ODBC connection string values containing ';', '{', '}', or
+        # spaces must be brace-quoted, with any literal '}' doubled.
+        # Without this, a ';' in e.g. a password would inject extra,
+        # attacker-controlled connection-string keywords.
+        return "{" + str(value).replace("}", "}}") + "}"
+
     def _connect(self):
+        esc = self._escape_conn_value
         conn_str = (
-            f"DRIVER={{{self.connection_info['driver']}}};"
-            f"SERVER={self.connection_info['server']};"
-            f"DATABASE={self.connection_info['database']};"
+            f"DRIVER={esc(self.connection_info['driver'])};"
+            f"SERVER={esc(self.connection_info['server'])};"
+            f"DATABASE={esc(self.connection_info['database'])};"
         )
         user = self.connection_info.get("user")
         password = self.connection_info.get("password")
         if user:
-            conn_str += f"UID={user};PWD={password};"
+            # password may legitimately be omitted/None; without the
+            # `or ""` this would render as the literal text "PWD=None;"
+            conn_str += f"UID={esc(user)};PWD={esc(password or '')};"
         else:
             conn_str += "Trusted_Connection=yes;"
         return pyodbc.connect(conn_str)
 
     def get_tables(self, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT TABLE_NAME
                 FROM INFORMATION_SCHEMA.TABLES
@@ -241,16 +231,9 @@ class SqlServerToolkit(DatabaseToolkit):
                 ORDER BY TABLE_NAME
             """)
             return [row[0] for row in cursor.fetchall()]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_columns(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
                 FROM INFORMATION_SCHEMA.COLUMNS
@@ -261,16 +244,9 @@ class SqlServerToolkit(DatabaseToolkit):
                 {"name": row[0], "type": row[1], "nullable": row[2]}
                 for row in cursor.fetchall()
             ]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_views(self, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT TABLE_NAME, VIEW_DEFINITION
                 FROM INFORMATION_SCHEMA.VIEWS
@@ -281,16 +257,9 @@ class SqlServerToolkit(DatabaseToolkit):
                 {"name": row[0], "definition": row[1]}
                 for row in cursor.fetchall()
             ]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_keys(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             cursor.execute("""
                 SELECT c.name AS column_name
                 FROM sys.indexes i
@@ -335,30 +304,16 @@ class SqlServerToolkit(DatabaseToolkit):
                 for row in cursor.fetchall()
             ]
             return {"primary_keys": primary_keys, "foreign_keys": foreign_keys}
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_row_count(self, table_name, conn=None):
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             quoted_table = self._quote_identifier(table_name)
             cursor.execute(f"SELECT COUNT(*) FROM [{self.SCHEMA}].{quoted_table};")
             return cursor.fetchone()[0]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
 
     def get_sample(self, table_name, limit=5, conn=None):
         limit = int(limit)
-        owns_conn = conn is None
-        conn = conn or self._connect()
-        cursor = conn.cursor()
-        try:
+        with self._cursor(conn) as cursor:
             quoted_table = self._quote_identifier(table_name)
             cursor.execute(
                 f"SELECT TOP (?) * FROM [{self.SCHEMA}].{quoted_table};",
@@ -367,7 +322,3 @@ class SqlServerToolkit(DatabaseToolkit):
             column_names = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
             return [dict(zip(column_names, row)) for row in rows]
-        finally:
-            cursor.close()
-            if owns_conn:
-                conn.close()
