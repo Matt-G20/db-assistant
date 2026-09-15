@@ -14,14 +14,6 @@ class DatabaseToolkit:
 
     @contextmanager
     def _cursor(self, conn=None):
-        """Yield a cursor for a query.
-
-        If the caller didn't pass a connection, one is opened here and
-        closed here when the block exits (even if cursor creation or the
-        query itself raises). If the caller passed a connection (as
-        get_full_schema does, to reuse one connection across many calls),
-        it is left open for the caller to close.
-        """
         owns_conn = conn is None
         conn = conn or self._connect()
         try:
@@ -53,10 +45,6 @@ class DatabaseToolkit:
         raise NotImplementedError("This method should be implemented by subclasses.")
 
     def get_full_schema(self):
-        # Open a single connection and thread it through every call below
-        # instead of letting each get_* method open its own. Without this,
-        # a database with N tables opened 3N+1 separate connections just to
-        # build one schema snapshot.
         conn = self._connect()
         try:
             tables = self.get_tables(conn=conn)
@@ -135,12 +123,6 @@ class PostgresToolkit(DatabaseToolkit):
             """, (table_name,))
             primary_keys = [row[0] for row in cursor.fetchall()]
 
-            # Note: joining key_column_usage/constraint_column_usage on
-            # constraint_name alone produces a cartesian product for
-            # composite (multi-column) foreign keys, silently pairing up
-            # unrelated columns. Using pg_constraint's conkey/confkey
-            # arrays (zipped positionally via unnest) pairs each local
-            # column with its correct referenced column instead.
             cursor.execute("""
                 SELECT
                     parent_att.attname AS column_name,
@@ -190,14 +172,6 @@ class PostgresToolkit(DatabaseToolkit):
 
 
 class SqlServerToolkit(DatabaseToolkit):
-    # Fallback schema used only when a caller passes a bare (unqualified)
-    # table name directly to get_columns/get_keys/get_row_count/get_sample
-    # instead of the "schema.table" form get_tables() returns. SQL Server
-    # databases routinely spread tables across multiple schemas (e.g. the
-    # AdventureWorks sample uses Sales, Person, Production, ...), so -
-    # unlike PostgresToolkit, which only ever deals with 'public' -
-    # get_tables() here returns every schema, qualified, rather than
-    # silently hiding everything outside one hardcoded schema.
     SCHEMA = "dbo"
 
     @staticmethod
@@ -213,10 +187,6 @@ class SqlServerToolkit(DatabaseToolkit):
 
     @staticmethod
     def _escape_conn_value(value):
-        # ODBC connection string values containing ';', '{', '}', or
-        # spaces must be brace-quoted, with any literal '}' doubled.
-        # Without this, a ';' in e.g. a password would inject extra,
-        # attacker-controlled connection-string keywords.
         return "{" + str(value).replace("}", "}}") + "}"
 
     def _connect(self):
@@ -229,8 +199,6 @@ class SqlServerToolkit(DatabaseToolkit):
         user = self.connection_info.get("user")
         password = self.connection_info.get("password")
         if user:
-            # password may legitimately be omitted/None; without the
-            # `or ""` this would render as the literal text "PWD=None;"
             conn_str += f"UID={esc(user)};PWD={esc(password or '')};"
         else:
             conn_str += "Trusted_Connection=yes;"
@@ -291,10 +259,6 @@ class SqlServerToolkit(DatabaseToolkit):
             """, (schema, name))
             primary_keys = [row[0] for row in cursor.fetchall()]
 
-            # sys.foreign_key_columns already stores one row per column
-            # pair (correctly matched via constraint_column_id), unlike
-            # the INFORMATION_SCHEMA key_column_usage/constraint_column_usage
-            # join which cartesian-products composite foreign keys.
             cursor.execute("""
                 SELECT
                     pc.name AS column_name,
